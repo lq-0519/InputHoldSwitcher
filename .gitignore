@@ -1,0 +1,23 @@
+# macOS and local IDE settings
+.DS_Store
+/.idea/
+/.vscode/
+
+# Local diagnostics, handoff notes and generated apps
+/work/
+/outputs/
+/HANDOFF.md
+/.build/
+/.swiftpm/
+/build/
+/dist/
+*.dSYM/
+*.dSYM.zip
+
+# Runtime data and private signing material
+*.log
+.env
+.env.*
+*.p12
+*.pfx
+*.key
