@@ -25,6 +25,9 @@ private let doubaoInputSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
 private let doubaoBundleIdentifier = "com.bytedance.inputmethod.doubaoime"
 /// Wait before checking whether Doubao's voice window appeared normally.
 private let voiceFallbackCheckDelaySeconds: TimeInterval = 0.80
+/// Interval for checking when an active voice window closes after a switch-back deadline expires.
+/// Checks run only while a release task is waiting for voice input to finish.
+private let releaseVoiceRecheckIntervalSeconds: TimeInterval = 0.10
 /// Low-frequency interval used only to verify that the long-lived event tap remains enabled.
 private let eventTapWatchdogIntervalSeconds: TimeInterval = 30
 
@@ -259,6 +262,9 @@ private final class HotKeyController {
     private var pendingEventTapRearm: DispatchWorkItem?
     /// Holds the pending switch-back task so a new press or settings change can cancel it.
     private var pendingReleaseSwitch: DispatchWorkItem?
+    /// Identifies the current release cycle, including voice-window retries.
+    /// Canceled callbacks must match this identity before changing tasks or switching input sources.
+    private var pendingReleaseSwitchID: UUID?
     /// Holds the delayed voice-window check used only after switching from another input source.
     private var pendingVoiceFallback: DispatchWorkItem?
     /// Tracks whether this app sent a supplemental trigger down that still needs a matching up.
@@ -581,6 +587,9 @@ private final class HotKeyController {
             scheduleVoiceFallbackIfNeeded()
         } else {
             resetVoiceFallback(sendKeyUp: true, reason: "trigger-released")
+            // 豆包仍处于选中状态时不会再次发出输入法切换通知。每轮真实松开后恢复监听顺序，
+            // 让延迟期间的下一次按下仍可在豆包消费事件之前取消旧计时，不依赖输入法重新激活。
+            scheduleEventTapRearm(reason: "trigger-released")
             scheduleReleaseSwitch()
         }
     }
@@ -702,22 +711,55 @@ private final class HotKeyController {
     private func scheduleReleaseSwitch() {
         cancelPendingReleaseSwitch(reason: "rescheduled")
         let delay = configuredReleaseSwitchDelaySeconds()
+        let releaseID = UUID()
+        pendingReleaseSwitchID = releaseID
+        AppLog.shared.write("release switch scheduled delay=\(delay) cycle=\(releaseID)")
+        scheduleReleaseSwitchCheck(releaseID: releaseID, delay: delay, waitingForVoiceEnd: false)
+    }
+
+    /// Queues a guarded check for one release cycle and keeps active voice input from being interrupted.
+    ///
+    /// A second press can be swallowed by Doubao without changing the selected input source. The voice
+    /// window is an independent signal in that case: after the original deadline, wait for it to close,
+    /// then allow a full release delay. A real press cancels this cycle, and a real release replaces it.
+    /// All checks and the final TIS selection run on the main queue without a second unchecked hop.
+    private func scheduleReleaseSwitchCheck(releaseID: UUID, delay: TimeInterval, waitingForVoiceEnd: Bool) {
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.enabled, !self.triggerPressed else { return }
+            guard let self, self.pendingReleaseSwitchID == releaseID, self.enabled, !self.triggerPressed else { return }
+            if self.isDoubaoVoiceWindowVisible() {
+                if !waitingForVoiceEnd {
+                    AppLog.shared.write("release switch deferred reason=voice-window-visible cycle=\(releaseID)")
+                    self.scheduleEventTapRearm(reason: "release-deadline-during-voice")
+                }
+                self.scheduleReleaseSwitchCheck(
+                    releaseID: releaseID,
+                    delay: releaseVoiceRecheckIntervalSeconds,
+                    waitingForVoiceEnd: true
+                )
+                return
+            }
+            if waitingForVoiceEnd {
+                let releaseDelay = configuredReleaseSwitchDelaySeconds()
+                AppLog.shared.write("release switch voice ended; restarting delay=\(releaseDelay) cycle=\(releaseID)")
+                self.scheduleReleaseSwitchCheck(releaseID: releaseID, delay: releaseDelay, waitingForVoiceEnd: false)
+                return
+            }
             self.pendingReleaseSwitch = nil
+            self.pendingReleaseSwitchID = nil
             self.switchToReleaseInputSource()
         }
         pendingReleaseSwitch = work
-        AppLog.shared.write("release switch scheduled delay=\(delay)")
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Cancels and clears the pending switch-back task.
+    /// Cancels the queued check and invalidates its cycle before any stale callback can select an input source.
     private func cancelPendingReleaseSwitch(reason: String) {
-        guard pendingReleaseSwitch != nil else { return }
+        guard pendingReleaseSwitchID != nil || pendingReleaseSwitch != nil else { return }
+        let releaseID = pendingReleaseSwitchID
+        pendingReleaseSwitchID = nil
         pendingReleaseSwitch?.cancel()
         pendingReleaseSwitch = nil
-        AppLog.shared.write("release switch canceled reason=\(reason)")
+        AppLog.shared.write("release switch canceled reason=\(reason) cycle=\(releaseID?.uuidString ?? "<unknown>")")
     }
 
     /// Maps a recorded modifier key code to the corresponding event flag.
@@ -740,10 +782,8 @@ private final class HotKeyController {
             return
         }
         AppLog.shared.write("release switch executing target=\(inputSourceID) current=\(InputSourceManager.shared.currentSourceID() ?? "<unknown>")")
-        DispatchQueue.main.async {
-            InputSourceManager.shared.switchTo(id: inputSourceID) { [weak self] error in
-                if let error { self?.onError?(error) }
-            }
+        InputSourceManager.shared.switchTo(id: inputSourceID) { [weak self] error in
+            if let error { self?.onError?(error) }
         }
     }
 }

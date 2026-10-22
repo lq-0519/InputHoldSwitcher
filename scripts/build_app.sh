@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
-BUILD_DIR="${PROJECT_DIR}/work/build"
+# Keep intermediate app bundles and reusable compiler caches outside the source repository.
+BUILD_DIR="${TMPDIR:-/tmp}/InputHoldSwitcher-build"
 OUTPUT_DIR="${PROJECT_DIR}/outputs"
 APP_NAME="按住切换输入法.app"
 APP_DIR="${BUILD_DIR}/${APP_NAME}"
@@ -12,7 +13,9 @@ export SWIFT_MODULECACHE_PATH="${BUILD_DIR}/SwiftModuleCache"
 
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${OUTPUT_DIR}"
 
+# Match Info.plist's minimum macOS version instead of inheriting the host toolchain's default.
 swiftc \
+  -target "$(uname -m)-apple-macosx13.0" \
   -O \
   -framework AppKit \
   -framework ApplicationServices \
