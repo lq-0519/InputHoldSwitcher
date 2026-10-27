@@ -17,8 +17,8 @@ private enum DefaultsKey {
 private let defaultReleaseSwitchDelaySeconds: TimeInterval = 0.10
 /// Smallest allowed release delay in seconds.
 private let minimumReleaseSwitchDelaySeconds: TimeInterval = 0
-/// Largest allowed release delay in seconds.
-private let maximumReleaseSwitchDelaySeconds: TimeInterval = 10
+/// Allows up to five minutes before switching back; shared by saved values, the settings stepper, and scheduling.
+private let maximumReleaseSwitchDelaySeconds: TimeInterval = 300
 /// Input source identifier used to recognize when Doubao has become active.
 private let doubaoInputSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
 /// Bundle identifier used to recognize Doubao-owned voice windows.
