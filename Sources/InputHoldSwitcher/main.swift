@@ -11,6 +11,8 @@ private enum DefaultsKey {
     static let enabled = "enabled"
     /// Stores the delay in seconds before switching to the release input source.
     static let releaseSwitchDelaySeconds = "releaseSwitchDelaySeconds"
+    /// Stores how long physical keyboard input must remain idle before an expired switch-back can execute.
+    static let keyboardIdleThresholdSeconds = "keyboardIdleThresholdSeconds"
 }
 
 /// Default delay used before switching back after the trigger key is released.
@@ -19,6 +21,12 @@ private let defaultReleaseSwitchDelaySeconds: TimeInterval = 0.10
 private let minimumReleaseSwitchDelaySeconds: TimeInterval = 0
 /// Allows up to five minutes before switching back; shared by saved values, the settings stepper, and scheduling.
 private let maximumReleaseSwitchDelaySeconds: TimeInterval = 300
+/// Requires a short pause after the last physical typing event before an expired switch-back executes.
+private let defaultKeyboardIdleThresholdSeconds: TimeInterval = 1.5
+/// Keeps idle retries positive while still allowing users to choose a very short pause.
+private let minimumKeyboardIdleThresholdSeconds: TimeInterval = 0.1
+/// Allows up to five minutes of keyboard inactivity, using the same bound for preferences and the settings stepper.
+private let maximumKeyboardIdleThresholdSeconds: TimeInterval = 300
 /// Input source identifier used to recognize when Doubao has become active.
 private let doubaoInputSourceID = "com.bytedance.inputmethod.doubaoime.pinyin"
 /// Bundle identifier used to recognize Doubao-owned voice windows.
@@ -45,9 +53,48 @@ private func configuredReleaseSwitchDelaySeconds() -> TimeInterval {
     return clampedReleaseSwitchDelay(defaults.double(forKey: DefaultsKey.releaseSwitchDelaySeconds))
 }
 
+/// Bounds the idle threshold and rejects nonfinite values so a preference cannot create an invalid retry deadline.
+private func clampedKeyboardIdleThreshold(_ value: TimeInterval) -> TimeInterval {
+    guard value.isFinite else { return defaultKeyboardIdleThresholdSeconds }
+    return min(max(value, minimumKeyboardIdleThresholdSeconds), maximumKeyboardIdleThresholdSeconds)
+}
+
+/// Reads the keyboard pause required before switching, defaulting to 1.5 seconds for existing installations.
+private func configuredKeyboardIdleThresholdSeconds() -> TimeInterval {
+    let defaults = UserDefaults.standard
+    guard defaults.object(forKey: DefaultsKey.keyboardIdleThresholdSeconds) != nil else {
+        return defaultKeyboardIdleThresholdSeconds
+    }
+    return clampedKeyboardIdleThreshold(defaults.double(forKey: DefaultsKey.keyboardIdleThresholdSeconds))
+}
+
 /// Formats a delay value for display in the settings window.
 private func formatDelaySeconds(_ value: TimeInterval) -> String {
     String(format: "%.2f", value)
+}
+
+/// Stores only physical key state and monotonic activity time, without retaining typed characters or querying other apps.
+private struct KeyboardActivityState {
+    /// Tracks ordinary keys still physically held; repeated key-down events keep one entry per key.
+    private(set) var pressedKeyCodes: Set<UInt16> = []
+    /// Records when a physical key-down or key-up was handled, including autorepeat and recovered releases.
+    private(set) var lastActivityUptime: TimeInterval?
+
+    /// Applies one physical typing edge and starts the idle interval from the most recent edge.
+    mutating func record(keyCode: UInt16, down: Bool, uptime: TimeInterval) {
+        if down {
+            pressedKeyCodes.insert(keyCode)
+        } else {
+            pressedKeyCodes.remove(keyCode)
+        }
+        lastActivityUptime = uptime
+    }
+
+    /// Returns only the unelapsed portion of the idle threshold; no observed typing adds no extra delay.
+    func remainingIdleDelay(threshold: TimeInterval, uptime: TimeInterval) -> TimeInterval {
+        guard let lastActivityUptime else { return 0 }
+        return max(0, threshold - max(0, uptime - lastActivityUptime))
+    }
 }
 
 private final class LoginItemManager {
@@ -265,6 +312,10 @@ private final class HotKeyController {
     /// Identifies the current release cycle, including voice-window retries.
     /// Canceled callbacks must match this identity before changing tasks or switching input sources.
     private var pendingReleaseSwitchID: UUID?
+    /// Preserves physical typing state across event-tap rearming while using the existing listen-only tap.
+    private var keyboardActivity = KeyboardActivityState()
+    /// Parks an expired release cycle until all held typing keys are released, avoiding repeated timer wakeups.
+    private var waitingForKeyboardRelease = false
     /// Holds the delayed voice-window check used only after switching from another input source.
     private var pendingVoiceFallback: DispatchWorkItem?
     /// Tracks whether this app sent a supplemental trigger down that still needs a matching up.
@@ -280,7 +331,7 @@ private final class HotKeyController {
     func start() -> Bool {
         stop()
         trigger = TriggerKey.load()
-        AppLog.shared.write("listener start trusted=\(accessibilityTrusted(prompt: false)) trigger=\(trigger.displayName) keyCode=\(trigger.keyCode) modifier=\(trigger.isModifier) mode=hid-release-only enabled=\(enabled)")
+        AppLog.shared.write("listener start trusted=\(accessibilityTrusted(prompt: false)) trigger=\(trigger.displayName) keyCode=\(trigger.keyCode) modifier=\(trigger.isModifier) mode=hid-release-with-keyboard-idle enabled=\(enabled) idle-threshold=\(configuredKeyboardIdleThresholdSeconds())")
         guard accessibilityTrusted(prompt: false) else {
             AppLog.shared.write("listener start failed reason=accessibility-not-trusted")
             onStateChange?(false, "需要辅助功能权限")
@@ -326,6 +377,7 @@ private final class HotKeyController {
         runLoopSource = nil
         eventTap = nil
         triggerPressed = false
+        keyboardActivity = KeyboardActivityState()
     }
 
     /// Reloads the trigger and enabled state without replacing the active event tap.
@@ -335,6 +387,7 @@ private final class HotKeyController {
         resetVoiceFallback(sendKeyUp: true, reason: "settings-reloaded")
         trigger = TriggerKey.load()
         triggerPressed = false
+        keyboardActivity = KeyboardActivityState()
         ignoredModifierReleaseKeyCode = keyCode
         if eventTap == nil, accessibilityTrusted(prompt: false) {
             _ = start()
@@ -343,7 +396,7 @@ private final class HotKeyController {
         }
     }
 
-    /// Observes trigger transitions and always passes the original event through unchanged.
+    /// Observes trigger transitions and physical typing activity while passing every original event through unchanged.
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             AppLog.shared.write("event tap disabled type=\(type.rawValue); re-enabling")
@@ -358,9 +411,10 @@ private final class HotKeyController {
 
         guard enabled else { return Unmanaged.passUnretained(event) }
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        let sourcePID = event.getIntegerValueField(.eventSourceUnixProcessID)
+        recordPhysicalKeyboardActivity(type: type, keyCode: eventKeyCode, sourcePID: sourcePID)
         guard eventKeyCode == trigger.keyCode else { return Unmanaged.passUnretained(event) }
         let eventPressed = event.flags.contains(modifierFlag(for: eventKeyCode))
-        let sourcePID = event.getIntegerValueField(.eventSourceUnixProcessID)
         let sourceState = event.getIntegerValueField(.eventSourceStateID)
         AppLog.shared.write("trigger event type=\(eventTypeName(type)) keyCode=\(eventKeyCode) pressed-before=\(triggerPressed) event-pressed=\(eventPressed) flags=\(event.flags.rawValue) source-pid=\(sourcePID) source-state=\(sourceState)")
 
@@ -420,6 +474,21 @@ private final class HotKeyController {
         return Unmanaged.passUnretained(event)
     }
 
+    /// Records ordinary hardware input before the trigger-key filter, ignoring modifiers and all injected events.
+    ///
+    /// Only timestamps and held key codes are updated on each event. A cycle parked at its deadline is resumed
+    /// once the last held key is released; its original delay is already complete, so only the idle threshold remains.
+    private func recordPhysicalKeyboardActivity(type: CGEventType, keyCode: UInt16, sourcePID: Int64) {
+        guard sourcePID == 0, keyCode != trigger.keyCode, type == .keyDown || type == .keyUp else { return }
+        keyboardActivity.record(keyCode: keyCode, down: type == .keyDown, uptime: ProcessInfo.processInfo.systemUptime)
+        guard waitingForKeyboardRelease, keyboardActivity.pressedKeyCodes.isEmpty,
+              let releaseID = pendingReleaseSwitchID else { return }
+        waitingForKeyboardRelease = false
+        let idleThreshold = configuredKeyboardIdleThresholdSeconds()
+        AppLog.shared.write("release switch keyboard released; waiting for idle=\(idleThreshold) cycle=\(releaseID)")
+        scheduleReleaseSwitchCheck(releaseID: releaseID, delay: idleThreshold, waitingForVoiceEnd: false)
+    }
+
     /// Returns whether an injected event originated from the currently running Doubao input method process.
     private func isDoubaoProcess(_ sourcePID: Int64) -> Bool {
         guard sourcePID > 0, sourcePID <= Int64(Int32.max) else { return false }
@@ -448,6 +517,7 @@ private final class HotKeyController {
             let previousSource = self.lastObservedInputSourceID ?? "<unknown>"
             self.lastObservedInputSourceID = currentSource
             guard currentSource == doubaoInputSourceID else {
+                self.cancelPendingReleaseSwitch(reason: "input-source-left-doubao")
                 AppLog.shared.write("input source changed previous=\(previousSource) current=\(currentSource); keeping stable event tap")
                 return
             }
@@ -722,10 +792,17 @@ private final class HotKeyController {
     /// A second press can be swallowed by Doubao without changing the selected input source. The voice
     /// window is an independent signal in that case: after the original deadline, wait for it to close,
     /// then allow a full release delay. A real press cancels this cycle, and a real release replaces it.
+    /// After that delay, ordinary hardware typing postpones switching until all keys are released and the
+    /// configured idle interval has elapsed. Held keys park the cycle until a release event; idle retries
+    /// wait only the remaining pause and never restart the full release delay.
     /// All checks and the final TIS selection run on the main queue without a second unchecked hop.
     private func scheduleReleaseSwitchCheck(releaseID: UUID, delay: TimeInterval, waitingForVoiceEnd: Bool) {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.pendingReleaseSwitchID == releaseID, self.enabled, !self.triggerPressed else { return }
+            guard InputSourceManager.shared.currentSourceID() == doubaoInputSourceID else {
+                self.cancelPendingReleaseSwitch(reason: "input-source-no-longer-doubao")
+                return
+            }
             if self.isDoubaoVoiceWindowVisible() {
                 if !waitingForVoiceEnd {
                     AppLog.shared.write("release switch deferred reason=voice-window-visible cycle=\(releaseID)")
@@ -744,8 +821,24 @@ private final class HotKeyController {
                 self.scheduleReleaseSwitchCheck(releaseID: releaseID, delay: releaseDelay, waitingForVoiceEnd: false)
                 return
             }
+            if !self.keyboardActivity.pressedKeyCodes.isEmpty {
+                self.pendingReleaseSwitch = nil
+                self.waitingForKeyboardRelease = true
+                AppLog.shared.write("release switch deferred reason=keyboard-held cycle=\(releaseID)")
+                return
+            }
+            let remainingIdleDelay = self.keyboardActivity.remainingIdleDelay(
+                threshold: configuredKeyboardIdleThresholdSeconds(),
+                uptime: ProcessInfo.processInfo.systemUptime
+            )
+            if remainingIdleDelay > 0 {
+                AppLog.shared.write("release switch deferred reason=keyboard-active remaining-idle=\(remainingIdleDelay) cycle=\(releaseID)")
+                self.scheduleReleaseSwitchCheck(releaseID: releaseID, delay: remainingIdleDelay, waitingForVoiceEnd: false)
+                return
+            }
             self.pendingReleaseSwitch = nil
             self.pendingReleaseSwitchID = nil
+            self.waitingForKeyboardRelease = false
             self.switchToReleaseInputSource()
         }
         pendingReleaseSwitch = work
@@ -754,6 +847,7 @@ private final class HotKeyController {
 
     /// Cancels the queued check and invalidates its cycle before any stale callback can select an input source.
     private func cancelPendingReleaseSwitch(reason: String) {
+        waitingForKeyboardRelease = false
         guard pendingReleaseSwitchID != nil || pendingReleaseSwitch != nil else { return }
         let releaseID = pendingReleaseSwitchID
         pendingReleaseSwitchID = nil
@@ -886,6 +980,10 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
     private let releaseDelayField = NSTextField()
     /// Stepper used to adjust the release switch delay without typing.
     private let releaseDelayStepper = NSStepper()
+    /// Edits the keyboard pause required after an expired release delay, expressed in seconds.
+    private let keyboardIdleField = NSTextField()
+    /// Adjusts the same persisted keyboard idle threshold in tenths of a second.
+    private let keyboardIdleStepper = NSStepper()
     private let keyRecorder = KeyRecorderButton()
     private let enabledCheckbox = NSButton(checkboxWithTitle: "启用松开后自动切回", target: nil, action: nil)
     /// Checkbox that controls whether the app launches automatically after login.
@@ -895,7 +993,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 570),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -937,8 +1035,10 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
 
         let releaseLabel = NSTextField(labelWithString: "切回的输入法")
         let releaseDelayLabel = NSTextField(labelWithString: "松开后延迟切回")
+        let keyboardIdleLabel = NSTextField(labelWithString: "键盘空闲阈值")
         releaseLabel.font = .systemFont(ofSize: 13, weight: .medium)
         releaseDelayLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        keyboardIdleLabel.font = .systemFont(ofSize: 13, weight: .medium)
 
         releasePopup.target = self
         releasePopup.action = #selector(selectionChanged(_:))
@@ -954,6 +1054,22 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         releaseDelayStepper.increment = 0.1
         releaseDelayStepper.target = self
         releaseDelayStepper.action = #selector(releaseDelayChanged(_:))
+
+        keyboardIdleField.delegate = self
+        keyboardIdleField.target = self
+        keyboardIdleField.action = #selector(keyboardIdleChanged(_:))
+        keyboardIdleField.placeholderString = "1.50"
+        keyboardIdleField.toolTip = "切回时间到达后，需连续停止键盘输入这么久才切回。范围：0.1～300 秒。"
+        keyboardIdleField.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        keyboardIdleStepper.minValue = minimumKeyboardIdleThresholdSeconds
+        keyboardIdleStepper.maxValue = maximumKeyboardIdleThresholdSeconds
+        keyboardIdleStepper.increment = 0.1
+        keyboardIdleStepper.valueWraps = false
+        keyboardIdleStepper.target = self
+        keyboardIdleStepper.action = #selector(keyboardIdleChanged(_:))
+        let keyboardIdleTip = NSTextField(wrappingLabelWithString: "切回时间到达后，如果仍在打字，则等键盘空闲达到阈值再切回。")
+        keyboardIdleTip.textColor = .secondaryLabelColor
+        keyboardIdleTip.font = .systemFont(ofSize: 12)
 
         let refreshButton = NSButton(title: "刷新输入法列表", target: self, action: #selector(refreshClicked))
         let permissionButton = NSButton(title: "授予/检查辅助功能权限", target: self, action: #selector(permissionClicked))
@@ -981,9 +1097,15 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         releaseDelayStack.alignment = .centerY
         releaseDelayStack.spacing = 8
 
+        let keyboardIdleStack = NSStackView(views: [keyboardIdleField, NSTextField(labelWithString: "秒"), keyboardIdleStepper])
+        keyboardIdleStack.orientation = .horizontal
+        keyboardIdleStack.alignment = .centerY
+        keyboardIdleStack.spacing = 8
+
         let sourceGrid = NSGridView(views: [
             [releaseLabel, releasePopup],
-            [releaseDelayLabel, releaseDelayStack]
+            [releaseDelayLabel, releaseDelayStack],
+            [keyboardIdleLabel, keyboardIdleStack]
         ])
         sourceGrid.rowSpacing = 10
         sourceGrid.columnSpacing = 16
@@ -994,7 +1116,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         permissionButtons.spacing = 8
 
         let stack = NSStackView(views: [
-            title, subtitle, sourceGrid, refreshButton, horizontalLine(), keyRecorder,
+            title, subtitle, sourceGrid, keyboardIdleTip, refreshButton, horizontalLine(), keyRecorder,
             enabledCheckbox, launchAtLoginCheckbox, horizontalLine(), permissionLabel,
             statusLabel, permissionButtons, tip
         ])
@@ -1010,6 +1132,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
             stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -20),
             subtitle.widthAnchor.constraint(equalToConstant: 500),
+            keyboardIdleTip.widthAnchor.constraint(equalToConstant: 500),
             tip.widthAnchor.constraint(equalToConstant: 500),
             sourceGrid.widthAnchor.constraint(equalToConstant: 500)
         ])
@@ -1028,6 +1151,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         enabledCheckbox.state = (defaults.object(forKey: DefaultsKey.enabled) == nil || defaults.bool(forKey: DefaultsKey.enabled)) ? .on : .off
         syncLaunchAtLoginCheckbox()
         syncReleaseDelayControls(configuredReleaseSwitchDelaySeconds())
+        syncKeyboardIdleControls(configuredKeyboardIdleThresholdSeconds())
         let trusted = accessibilityTrusted(prompt: false)
         updateStatus(isListening: trusted, text: trusted ? (enabledCheckbox.state == .on ? "运行中" : "已暂停") : "需要辅助功能权限")
     }
@@ -1097,11 +1221,22 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         commitReleaseDelayFromTextField(refreshTextField: true)
     }
 
+    /// Commits the idle threshold from either its text field or its stepper using the same validation.
+    @objc private func keyboardIdleChanged(_ sender: NSControl) {
+        if sender === keyboardIdleStepper {
+            persistKeyboardIdleThreshold(keyboardIdleStepper.doubleValue, refreshTextField: true)
+            return
+        }
+        commitKeyboardIdleFromTextField(refreshTextField: true)
+    }
+
     /// Persists valid delay edits while the user is typing.
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField else { return }
         if field === releaseDelayField {
             commitReleaseDelayFromTextField(refreshTextField: false)
+        } else if field === keyboardIdleField {
+            commitKeyboardIdleFromTextField(refreshTextField: false)
         }
     }
 
@@ -1110,6 +1245,8 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         guard let field = obj.object as? NSTextField else { return }
         if field === releaseDelayField {
             commitReleaseDelayFromTextField(refreshTextField: true)
+        } else if field === keyboardIdleField {
+            commitKeyboardIdleFromTextField(refreshTextField: true)
         }
     }
 
@@ -1137,6 +1274,32 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
         let clamped = clampedReleaseSwitchDelay(value)
         releaseDelayField.stringValue = formatDelaySeconds(clamped)
         releaseDelayStepper.doubleValue = clamped
+    }
+
+    /// Parses finite idle edits, accepting a comma decimal separator and restoring the saved value for invalid input.
+    private func commitKeyboardIdleFromTextField(refreshTextField: Bool) {
+        let normalized = keyboardIdleField.stringValue.replacingOccurrences(of: ",", with: ".")
+        guard let rawValue = TimeInterval(normalized), rawValue.isFinite else {
+            if refreshTextField { syncKeyboardIdleControls(configuredKeyboardIdleThresholdSeconds()) }
+            return
+        }
+        persistKeyboardIdleThreshold(rawValue, refreshTextField: refreshTextField)
+    }
+
+    /// Persists a bounded idle threshold, synchronizes its controls, and cancels obsolete switch-back tasks.
+    private func persistKeyboardIdleThreshold(_ rawValue: TimeInterval, refreshTextField: Bool) {
+        let value = clampedKeyboardIdleThreshold(rawValue)
+        UserDefaults.standard.set(value, forKey: DefaultsKey.keyboardIdleThresholdSeconds)
+        keyboardIdleStepper.doubleValue = value
+        if refreshTextField { keyboardIdleField.stringValue = formatDelaySeconds(value) }
+        HotKeyController.shared.reloadSettings()
+    }
+
+    /// Restores the idle controls from a validated preference without changing its persisted value.
+    private func syncKeyboardIdleControls(_ value: TimeInterval) {
+        let clamped = clampedKeyboardIdleThreshold(value)
+        keyboardIdleField.stringValue = formatDelaySeconds(clamped)
+        keyboardIdleStepper.doubleValue = clamped
     }
 
     /// Updates the login item checkbox from the current system registration status.
@@ -1173,6 +1336,7 @@ private final class SettingsWindowController: NSWindowController, NSWindowDelega
 
     func windowWillClose(_ notification: Notification) {
         commitReleaseDelayFromTextField(refreshTextField: true)
+        commitKeyboardIdleFromTextField(refreshTextField: true)
         keyRecorder.stopRecording()
     }
 }
@@ -1213,7 +1377,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             DefaultsKey.enabled: true,
-            DefaultsKey.releaseSwitchDelaySeconds: defaultReleaseSwitchDelaySeconds
+            DefaultsKey.releaseSwitchDelaySeconds: defaultReleaseSwitchDelaySeconds,
+            DefaultsKey.keyboardIdleThresholdSeconds: defaultKeyboardIdleThresholdSeconds
         ])
         if UserDefaults.standard.object(forKey: DefaultsKey.triggerKeyCode) == nil {
             TriggerKey.defaultKey.save()
