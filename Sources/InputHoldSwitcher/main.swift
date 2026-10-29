@@ -1,7 +1,9 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import Darwin
 import ServiceManagement
+import notify
 
 private enum DefaultsKey {
     static let releaseInputSourceID = "releaseInputSourceID"
@@ -36,8 +38,80 @@ private let voiceFallbackCheckDelaySeconds: TimeInterval = 0.80
 /// Interval for checking when an active voice window closes after a switch-back deadline expires.
 /// Checks run only while a release task is waiting for voice input to finish.
 private let releaseVoiceRecheckIntervalSeconds: TimeInterval = 0.10
-/// Low-frequency interval used only to verify that the long-lived event tap remains enabled.
+/// Reuses one low-frequency timer for tap health, missed inventory notifications, and diagnostics.
 private let eventTapWatchdogIntervalSeconds: TimeInterval = 30
+/// Emits a compact listener heartbeat at most once per five minutes, without adding another timer.
+private let listenerHeartbeatIntervalSeconds: TimeInterval = 300
+
+/// Bounds event-driven maintenance so competing taps or notification storms cannot create a rebuild loop.
+///
+/// All access is on the main queue. A burst exceeding the limit suspends work for 30 seconds; expiration
+/// does not schedule a retry. Only a later external signal or the existing watchdog may request work.
+/// The retained timestamps never exceed the configured attempt limit, including failed attempts.
+private struct EventTapMaintenanceBudget {
+    /// Smallest spacing between admitted operations; callers coalesce requests into one delayed task.
+    let minimumSpacing: TimeInterval
+    /// Maximum operations admitted in a two-second window before suspending this kind of maintenance.
+    let maximumAttempts: Int
+    /// Stores only recently admitted operations, using monotonic uptime rather than the wall clock.
+    private var attemptUptimes: [TimeInterval] = []
+    /// Keeps spacing across windows and pauses without retaining an unbounded operation history.
+    private var lastAttemptUptime: TimeInterval?
+    /// Blocks scheduling during a burst cooldown, which never owns a retry timer.
+    private var suspendedUntilUptime: TimeInterval = 0
+
+    /// Creates an independent budget for rebuilding or enumerating taps.
+    init(minimumSpacing: TimeInterval, maximumAttempts: Int) {
+        self.minimumSpacing = minimumSpacing
+        self.maximumAttempts = maximumAttempts
+    }
+
+    /// Returns a one-shot scheduling delay, or nil when maintenance is currently suspended.
+    func schedulingDelay(uptime: TimeInterval) -> TimeInterval? {
+        guard uptime >= suspendedUntilUptime else { return nil }
+        return max(0, (lastAttemptUptime ?? (uptime - minimumSpacing)) + minimumSpacing - uptime)
+    }
+
+    /// Charges an operation immediately before doing work, including operations that subsequently fail.
+    mutating func admit(uptime: TimeInterval) -> Bool {
+        guard let delay = schedulingDelay(uptime: uptime), delay <= 0 else { return false }
+        attemptUptimes.removeAll { uptime - $0 >= 2 }
+        guard attemptUptimes.count < maximumAttempts else {
+            suspendedUntilUptime = uptime + 30
+            attemptUptimes.removeAll(keepingCapacity: true)
+            return false
+        }
+        lastAttemptUptime = uptime
+        attemptUptimes.append(uptime)
+        return true
+    }
+}
+
+/// Selects enabled Doubao filtering HID taps that can intercept the configured trigger.
+///
+/// Ownership is resolved once per relevant process in the bounded snapshot. Filtering by location,
+/// options, and event mask excludes this app's listen-only tap, unrelated taps, and mouse-only taps.
+/// Keeping selection independent of list order also allows deterministic validation without installing taps.
+private func doubaoFilteringTapIDs(
+    in taps: ArraySlice<CGEventTapInformation>,
+    trigger: TriggerKey,
+    belongsToDoubao: (pid_t) -> Bool
+) -> Set<UInt32> {
+    let triggerMask: CGEventMask = trigger.isModifier
+        ? (1 << CGEventType.flagsChanged.rawValue)
+        : ((1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue))
+    var matchingIDs = Set<UInt32>()
+    var owners: [pid_t: Bool] = [:]
+    for tap in taps {
+        guard tap.enabled, tap.tapPoint == .cghidEventTap,
+              tap.options.rawValue & CGEventTapOptions.listenOnly.rawValue == 0,
+              tap.eventsOfInterest & triggerMask != 0 else { continue }
+        let matchesOwner = owners[tap.tappingProcess] ?? belongsToDoubao(tap.tappingProcess)
+        owners[tap.tappingProcess] = matchesOwner
+        if matchesOwner { matchingIDs.insert(tap.eventTapID) }
+    }
+    return matchingIDs
+}
 
 /// Clamps a release delay so user input cannot create an unusable schedule.
 private func clampedReleaseSwitchDelay(_ value: TimeInterval) -> TimeInterval {
@@ -300,13 +374,45 @@ private final class HotKeyController {
     private var inputSourceChangeObserver: NSObjectProtocol?
     /// Remembers the last selected input source so duplicate system notifications do not trigger maintenance repeatedly.
     private var lastObservedInputSourceID: String?
-    /// Periodically checks the existing event tap and never replaces a healthy tap.
+    /// Owns the single 30-second watchdog; a healthy tap with an unchanged inventory remains untouched.
     private var eventTapWatchdogTimer: Timer?
+    /// Cancels Darwin subscriptions when listening stops; only the two CoreGraphics tap notifications are registered.
+    private var eventTapNotificationTokens: [Int32] = []
+    /// Rejects callbacks delivered after subscriptions or the listener have been replaced.
+    private var maintenanceGeneration: UUID?
+    /// Tracks Doubao's filtering HID taps; own taps and unrelated processes never enter this set.
+    private var observedDoubaoTapIDs: Set<UInt32>?
+    /// Coalesces added/removed notifications into at most one bounded inventory scan.
+    private var pendingEventTapInventoryCheck: DispatchWorkItem?
+    /// Prevents an old canceled scan from clearing or executing a newer queued scan.
+    private var pendingEventTapInventoryCheckID: UUID?
+    /// Limits inventory scans to twelve per two seconds, with 100 ms spacing and a 30-second burst pause.
+    private var inventoryBudget = EventTapMaintenanceBudget(minimumSpacing: 0.1, maximumAttempts: 12)
+    /// Limits all tap replacements to eight per two seconds, with 50 ms spacing and a 30-second burst pause.
+    private var rearmBudget = EventTapMaintenanceBudget(minimumSpacing: 0.05, maximumAttempts: 8)
+    /// Owns sleep/wake subscriptions for the same lifetime as the active keyboard listener.
+    private var workspaceObservers: [NSObjectProtocol] = []
+    /// Blocks keyboard state changes and queued maintenance while the machine is sleeping.
+    private var systemSleeping = false
+    /// Coalesces duplicate wake notifications so they cannot repeatedly reset a fresh input cycle.
+    private var lastWakeUptime: TimeInterval?
+    /// Counts delivered events without logging ordinary typing or retaining its contents.
+    private var receivedEventCount: UInt64 = 0
+    /// Counts physical trigger edges for diagnosing a live tap that stops receiving real keys.
+    private var physicalTriggerEventCount: UInt64 = 0
+    /// Counts attempted tap replacements, including failures, to expose recovery frequency in diagnostics.
+    private var eventTapRebuildCount: UInt64 = 0
+    /// Counts admitted inventory scans so diagnostics can reveal unusually frequent maintenance.
+    private var eventTapInventoryCheckCount: UInt64 = 0
+    /// Uses the existing watchdog to limit heartbeat writes to one per five minutes.
+    private var lastHeartbeatUptime: TimeInterval = 0
     private var trigger = TriggerKey.load()
     private var triggerPressed = false
     private var ignoredModifierReleaseKeyCode: UInt16?
     /// Holds a queued event-tap replacement so concurrent recovery signals cannot schedule duplicate rebuilds.
     private var pendingEventTapRearm: DispatchWorkItem?
+    /// Identifies the queued replacement so canceled work cannot act on a later request.
+    private var pendingEventTapRearmID: UUID?
     /// Holds the pending switch-back task so a new press or settings change can cancel it.
     private var pendingReleaseSwitch: DispatchWorkItem?
     /// Identifies the current release cycle, including voice-window retries.
@@ -318,6 +424,8 @@ private final class HotKeyController {
     private var waitingForKeyboardRelease = false
     /// Holds the delayed voice-window check used only after switching from another input source.
     private var pendingVoiceFallback: DispatchWorkItem?
+    /// Prevents an earlier canceled voice check from posting a key during a newer press cycle.
+    private var pendingVoiceFallbackID: UUID?
     /// Tracks whether this app sent a supplemental trigger down that still needs a matching up.
     private var supplementalTriggerDownSent = false
 
@@ -338,6 +446,8 @@ private final class HotKeyController {
             return false
         }
 
+        // Snapshot before inserting our own tap so a concurrently added Doubao tap is still detected.
+        let initialDoubaoTapIDs = currentDoubaoFilteringTapIDs()
         let mask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.flagsChanged.rawValue)
@@ -360,7 +470,7 @@ private final class HotKeyController {
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        startEventTapMaintenance()
+        startEventTapMaintenance(initialDoubaoTapIDs: initialDoubaoTapIDs)
         AppLog.shared.write("listener started eventTapEnabled=true")
         onStateChange?(true, enabled ? "运行中" : "已暂停")
         return true
@@ -377,11 +487,14 @@ private final class HotKeyController {
         runLoopSource = nil
         eventTap = nil
         triggerPressed = false
+        ignoredModifierReleaseKeyCode = nil
         keyboardActivity = KeyboardActivityState()
+        systemSleeping = false
     }
 
-    /// Reloads the trigger and enabled state without replacing the active event tap.
+    /// Reloads settings, cancels the old input cycle, and requests one bounded repair when enabled.
     func reloadSettings(ignoreNextModifierReleaseFor keyCode: UInt16? = nil) {
+        cancelPendingEventTapInventoryCheck()
         cancelPendingEventTapRearm(reason: "settings-reloaded")
         cancelPendingReleaseSwitch(reason: "settings-reloaded")
         resetVoiceFallback(sendKeyUp: true, reason: "settings-reloaded")
@@ -392,12 +505,19 @@ private final class HotKeyController {
         if eventTap == nil, accessibilityTrusted(prompt: false) {
             _ = start()
         } else {
+            observedDoubaoTapIDs = nil
+            if enabled, !systemSleeping {
+                scheduleEventTapInventoryCheck()
+                scheduleEventTapRearm(reason: "settings-reloaded")
+            }
             onStateChange?(eventTap != nil, enabled ? "运行中" : "已暂停")
         }
     }
 
     /// Observes trigger transitions and physical typing activity while passing every original event through unchanged.
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard !systemSleeping else { return Unmanaged.passUnretained(event) }
+        receivedEventCount &+= 1
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             AppLog.shared.write("event tap disabled type=\(type.rawValue); re-enabling")
             if let tap = eventTap {
@@ -414,6 +534,7 @@ private final class HotKeyController {
         let sourcePID = event.getIntegerValueField(.eventSourceUnixProcessID)
         recordPhysicalKeyboardActivity(type: type, keyCode: eventKeyCode, sourcePID: sourcePID)
         guard eventKeyCode == trigger.keyCode else { return Unmanaged.passUnretained(event) }
+        if sourcePID == 0 { physicalTriggerEventCount &+= 1 }
         let eventPressed = event.flags.contains(modifierFlag(for: eventKeyCode))
         let sourceState = event.getIntegerValueField(.eventSourceStateID)
         AppLog.shared.write("trigger event type=\(eventTypeName(type)) keyCode=\(eventKeyCode) pressed-before=\(triggerPressed) event-pressed=\(eventPressed) flags=\(event.flags.rawValue) source-pid=\(sourcePID) source-state=\(sourceState)")
@@ -496,22 +617,26 @@ private final class HotKeyController {
         return application?.bundleIdentifier == doubaoBundleIdentifier
     }
 
-    /// Starts event-driven precedence recovery plus a low-frequency health check for the long-lived tap.
+    /// Subscribes to tap changes and sleep/wake events, retaining the existing low-frequency watchdog.
     ///
-    /// Doubao may create a new HID tap when its input source becomes active, so that one transition still
-    /// receives a controlled replacement at head priority. The periodic timer only checks whether macOS
-    /// disabled the current tap; it never replaces a healthy tap and therefore cannot grow WindowServer's
-    /// event-tap chain during normal idle operation.
-    private func startEventTapMaintenance() {
+    /// A new Doubao filtering tap can consume trigger releases while Doubao remains the selected source.
+    /// CoreGraphics notifications catch that case without another keyboard tap or fast idle polling.
+    /// Subscription generations and queued-work identities reject callbacks from obsolete listeners.
+    private func startEventTapMaintenance(initialDoubaoTapIDs: Set<UInt32>?) {
         stopEventTapMaintenance()
+        let generation = UUID()
+        maintenanceGeneration = generation
+        observedDoubaoTapIDs = initialDoubaoTapIDs
         lastObservedInputSourceID = InputSourceManager.shared.currentSourceID()
+        lastHeartbeatUptime = ProcessInfo.processInfo.systemUptime
         let notificationName = Notification.Name(rawValue: kTISNotifySelectedKeyboardInputSourceChanged as String)
         inputSourceChangeObserver = DistributedNotificationCenter.default().addObserver(
             forName: notificationName,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.enabled, self.eventTap != nil else { return }
+            guard let self, self.maintenanceGeneration == generation, !self.systemSleeping,
+                  self.enabled, self.eventTap != nil else { return }
             let currentSource = InputSourceManager.shared.currentSourceID() ?? "<unknown>"
             guard currentSource != self.lastObservedInputSourceID else { return }
             let previousSource = self.lastObservedInputSourceID ?? "<unknown>"
@@ -525,17 +650,63 @@ private final class HotKeyController {
             self.scheduleEventTapRearm(reason: "doubao-input-source-activated")
         }
 
-        let timer = Timer(timeInterval: eventTapWatchdogIntervalSeconds, repeats: true) { [weak self] _ in
-            guard let self, self.enabled else { return }
-            self.performEventTapHealthCheck()
+        for name in ["com.apple.coregraphics.eventTapAdded", "com.apple.coregraphics.eventTapRemoved"] {
+            var token: Int32 = 0
+            let status = notify_register_dispatch(name, &token, DispatchQueue.main) { [weak self] _ in
+                guard let self, self.maintenanceGeneration == generation else { return }
+                self.scheduleEventTapInventoryCheck()
+            }
+            if status == NOTIFY_STATUS_OK {
+                eventTapNotificationTokens.append(token)
+            } else {
+                AppLog.shared.write("event tap notification registration failed name=\(name) status=\(status)")
+            }
         }
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(workspaceCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.maintenanceGeneration == generation, !self.systemSleeping else { return }
+            self.systemSleeping = true
+            self.endInputCycleForSleepTransition(reason: "system-will-sleep")
+        })
+        workspaceObservers.append(workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.maintenanceGeneration == generation else { return }
+            let uptime = ProcessInfo.processInfo.systemUptime
+            guard self.systemSleeping || uptime - (self.lastWakeUptime ?? (uptime - 2)) >= 2 else { return }
+            self.lastWakeUptime = uptime
+            self.endInputCycleForSleepTransition(reason: "system-did-wake")
+            self.systemSleeping = false
+            self.lastObservedInputSourceID = InputSourceManager.shared.currentSourceID()
+            self.scheduleEventTapInventoryCheck()
+            self.scheduleEventTapRearm(reason: "system-did-wake")
+        })
+
+        let timer = Timer(timeInterval: eventTapWatchdogIntervalSeconds, repeats: true) { [weak self] _ in
+            guard let self, self.maintenanceGeneration == generation,
+                  self.enabled, !self.systemSleeping else { return }
+            self.performEventTapHealthCheck()
+            self.scheduleEventTapInventoryCheck()
+            self.writeListenerHeartbeatIfNeeded()
+        }
+        timer.tolerance = 3
         eventTapWatchdogTimer = timer
         RunLoop.main.add(timer, forMode: .common)
-        AppLog.shared.write("event tap maintenance started mode=health-check-only watchdog-interval=\(eventTapWatchdogIntervalSeconds)")
+        // Covers taps added between the initial inventory and Darwin notification registration.
+        scheduleEventTapInventoryCheck()
+        AppLog.shared.write("event tap maintenance started mode=bounded-notifications watchdog-interval=\(eventTapWatchdogIntervalSeconds)")
     }
 
-    /// Stops input-source observation and the fallback timer associated with the active listener.
+    /// Invalidates the subscription generation before removing observers, tokens, and queued inventory work.
     private func stopEventTapMaintenance() {
+        maintenanceGeneration = nil
+        cancelPendingEventTapInventoryCheck()
+        for token in eventTapNotificationTokens { notify_cancel(token) }
+        eventTapNotificationTokens.removeAll()
+        for observer in workspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        workspaceObservers.removeAll()
         if let observer = inputSourceChangeObserver {
             DistributedNotificationCenter.default().removeObserver(observer)
             inputSourceChangeObserver = nil
@@ -543,6 +714,84 @@ private final class HotKeyController {
         eventTapWatchdogTimer?.invalidate()
         eventTapWatchdogTimer = nil
         lastObservedInputSourceID = nil
+        observedDoubaoTapIDs = nil
+    }
+
+    /// Ends the old physical input cycle across sleep boundaries without guessing a modifier's physical state.
+    ///
+    /// Doubao can inject modifier changes, so querying aggregate Control state during an ordinary rebuild
+    /// could interrupt a real hold. Sleep is an explicit boundary: cancel all old tasks and await fresh
+    /// hardware events after wake, rather than immediately switching or restarting the application.
+    private func endInputCycleForSleepTransition(reason: String) {
+        cancelPendingEventTapInventoryCheck()
+        cancelPendingEventTapRearm(reason: reason)
+        cancelPendingReleaseSwitch(reason: reason)
+        resetVoiceFallback(sendKeyUp: true, reason: reason)
+        triggerPressed = false
+        ignoredModifierReleaseKeyCode = nil
+        keyboardActivity = KeyboardActivityState()
+        AppLog.shared.write("input cycle reset reason=\(reason); awaiting fresh trigger events")
+    }
+
+    /// Enumerates a fixed-capacity snapshot of relevant Doubao taps without relying on undocumented list ordering.
+    ///
+    /// Only enabled, filtering HID taps interested in this trigger qualify. Own listen-only taps and
+    /// unrelated apps are excluded. A failed or truncated snapshot is unknown, never an empty inventory;
+    /// callers keep the last valid baseline so a transient enumeration error cannot hide new tap IDs.
+    private func currentDoubaoFilteringTapIDs() -> Set<UInt32>? {
+        var taps = [CGEventTapInformation](repeating: CGEventTapInformation(), count: 256)
+        var count: UInt32 = 0
+        let result = taps.withUnsafeMutableBufferPointer { buffer in
+            CGGetEventTapList(UInt32(buffer.count), buffer.baseAddress, &count)
+        }
+        guard result == .success, count < UInt32(taps.count) else { return nil }
+        return doubaoFilteringTapIDs(in: taps.prefix(Int(count)), trigger: trigger) { pid in
+            isDoubaoProcess(Int64(pid))
+        }
+    }
+
+    /// Coalesces all inventory signals, caps storm work, and repairs only newly observed Doubao filtering taps.
+    private func scheduleEventTapInventoryCheck() {
+        guard maintenanceGeneration != nil, enabled, !systemSleeping,
+              pendingEventTapInventoryCheckID == nil,
+              let delay = inventoryBudget.schedulingDelay(uptime: ProcessInfo.processInfo.systemUptime) else { return }
+        let checkID = UUID()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.pendingEventTapInventoryCheckID == checkID,
+                  self.maintenanceGeneration != nil, self.enabled, !self.systemSleeping else { return }
+            self.pendingEventTapInventoryCheckID = nil
+            self.pendingEventTapInventoryCheck = nil
+            guard self.inventoryBudget.admit(uptime: ProcessInfo.processInfo.systemUptime) else {
+                AppLog.shared.write("event tap inventory suspended for 30s reason=notification-burst")
+                return
+            }
+            self.eventTapInventoryCheckCount &+= 1
+            guard let currentIDs = self.currentDoubaoFilteringTapIDs() else { return }
+            let newIDs = currentIDs.subtracting(self.observedDoubaoTapIDs ?? [])
+            self.observedDoubaoTapIDs = currentIDs
+            guard !newIDs.isEmpty, InputSourceManager.shared.currentSourceID() == doubaoInputSourceID else { return }
+            AppLog.shared.write("new doubao filtering taps ids=\(newIDs.sorted()); restoring event tap precedence")
+            self.scheduleEventTapRearm(reason: "doubao-filtering-tap-added")
+        }
+        pendingEventTapInventoryCheckID = checkID
+        pendingEventTapInventoryCheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Invalidates the queued inventory identity before canceling its one-shot task.
+    private func cancelPendingEventTapInventoryCheck() {
+        pendingEventTapInventoryCheckID = nil
+        pendingEventTapInventoryCheck?.cancel()
+        pendingEventTapInventoryCheck = nil
+    }
+
+    /// Records small cumulative counters and current state only every five minutes, reusing the watchdog.
+    private func writeListenerHeartbeatIfNeeded() {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard uptime - lastHeartbeatUptime >= listenerHeartbeatIntervalSeconds else { return }
+        lastHeartbeatUptime = uptime
+        let tapEnabled = eventTap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false
+        AppLog.shared.write("listener heartbeat tap-enabled=\(tapEnabled) events=\(receivedEventCount) physical-trigger-events=\(physicalTriggerEventCount) pressed=\(triggerPressed) release-cycle=\(pendingReleaseSwitchID?.uuidString ?? "<none>") held-keys=\(keyboardActivity.pressedKeyCodes.count) doubao-taps=\((observedDoubaoTapIDs ?? []).sorted()) rebuilds=\(eventTapRebuildCount) inventory-checks=\(eventTapInventoryCheckCount)")
     }
 
     /// Verifies the current tap without changing its identity or position in WindowServer's event chain.
@@ -552,8 +801,7 @@ private final class HotKeyController {
     /// replacement is scheduled only when the port is missing or remains disabled after the enable call.
     private func performEventTapHealthCheck() {
         guard let tap = eventTap else {
-            AppLog.shared.write("event tap health check failed reason=no-active-listener; restarting listener")
-            _ = start()
+            scheduleEventTapRearm(reason: "health-check-no-active-listener")
             return
         }
         guard !CGEvent.tapIsEnabled(tap: tap) else { return }
@@ -567,35 +815,39 @@ private final class HotKeyController {
         scheduleEventTapRearm(reason: "health-check-reenable-failed")
     }
 
-    /// Queues one main-run-loop event-tap replacement while preserving the current physical hold state.
+    /// Queues one identity-guarded replacement and applies a shared rate limit to every recovery path.
     private func scheduleEventTapRearm(reason: String) {
-        guard pendingEventTapRearm == nil else {
-            AppLog.shared.write("event tap rearm already pending reason=\(reason)")
-            return
-        }
-
+        guard maintenanceGeneration != nil, enabled, !systemSleeping, pendingEventTapRearmID == nil,
+              let delay = rearmBudget.schedulingDelay(uptime: ProcessInfo.processInfo.systemUptime) else { return }
+        let rearmID = UUID()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingEventTapRearm != nil else { return }
+            guard let self, self.pendingEventTapRearmID == rearmID,
+                  self.maintenanceGeneration != nil, self.enabled, !self.systemSleeping else { return }
+            self.pendingEventTapRearmID = nil
             self.pendingEventTapRearm = nil
+            guard self.rearmBudget.admit(uptime: ProcessInfo.processInfo.systemUptime) else {
+                AppLog.shared.write("event tap rearm suspended for 30s reason=recovery-burst")
+                return
+            }
+            self.eventTapRebuildCount &+= 1
             self.rebuildEventTapPreservingState(reason: reason)
         }
+        pendingEventTapRearmID = rearmID
         pendingEventTapRearm = work
         AppLog.shared.write("event tap rearm scheduled reason=\(reason)")
-        DispatchQueue.main.async(execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     /// Replaces the HID event tap at head priority without clearing timers or the inferred pressed state.
     private func rebuildEventTapPreservingState(reason: String) {
-        guard eventTap != nil else {
-            AppLog.shared.write("event tap rearm skipped reason=no-active-listener trigger=\(reason)")
-            return
-        }
         guard accessibilityTrusted(prompt: false) else {
             AppLog.shared.write("event tap rearm failed reason=accessibility-not-trusted trigger=\(reason)")
             onStateChange?(false, "需要辅助功能权限")
             return
         }
 
+        // Keep additions racing with tapCreate visible to the next notification-driven inventory check.
+        if let currentIDs = currentDoubaoFilteringTapIDs() { observedDoubaoTapIDs = currentIDs }
         let mask = (1 << CGEventType.keyDown.rawValue)
             | (1 << CGEventType.keyUp.rawValue)
             | (1 << CGEventType.flagsChanged.rawValue)
@@ -644,6 +896,7 @@ private final class HotKeyController {
     /// Cancels a queued event-tap replacement that has not executed yet.
     private func cancelPendingEventTapRearm(reason: String) {
         guard pendingEventTapRearm != nil else { return }
+        pendingEventTapRearmID = nil
         pendingEventTapRearm?.cancel()
         pendingEventTapRearm = nil
         AppLog.shared.write("event tap rearm canceled reason=\(reason)")
@@ -657,9 +910,8 @@ private final class HotKeyController {
             scheduleVoiceFallbackIfNeeded()
         } else {
             resetVoiceFallback(sendKeyUp: true, reason: "trigger-released")
-            // 豆包仍处于选中状态时不会再次发出输入法切换通知。每轮真实松开后恢复监听顺序，
-            // 让延迟期间的下一次按下仍可在豆包消费事件之前取消旧计时，不依赖输入法重新激活。
-            scheduleEventTapRearm(reason: "trigger-released")
+            // 豆包仍被选中时也可能重建监听器；检查变化即可，不必每次松手都替换健康的 tap。
+            scheduleEventTapInventoryCheck()
             scheduleReleaseSwitch()
         }
     }
@@ -672,8 +924,11 @@ private final class HotKeyController {
             return
         }
 
+        let fallbackID = UUID()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.enabled, self.triggerPressed else { return }
+            guard let self, self.pendingVoiceFallbackID == fallbackID,
+                  self.enabled, !self.systemSleeping, self.triggerPressed else { return }
+            self.pendingVoiceFallbackID = nil
             self.pendingVoiceFallback = nil
             let currentSource = InputSourceManager.shared.currentSourceID()
             guard currentSource == doubaoInputSourceID else {
@@ -690,6 +945,7 @@ private final class HotKeyController {
                 AppLog.shared.write("voice fallback supplemental keyDown sent delay=\(voiceFallbackCheckDelaySeconds)")
             }
         }
+        pendingVoiceFallbackID = fallbackID
         pendingVoiceFallback = work
         AppLog.shared.write("voice fallback check scheduled delay=\(voiceFallbackCheckDelaySeconds) source-before=\(sourceBeforePress ?? "<unknown>")")
         DispatchQueue.main.asyncAfter(deadline: .now() + voiceFallbackCheckDelaySeconds, execute: work)
@@ -697,6 +953,7 @@ private final class HotKeyController {
 
     /// Cancels the fallback check and optionally releases a supplemental trigger that was sent earlier.
     private func resetVoiceFallback(sendKeyUp: Bool, reason: String) {
+        pendingVoiceFallbackID = nil
         if pendingVoiceFallback != nil {
             pendingVoiceFallback?.cancel()
             pendingVoiceFallback = nil
@@ -798,7 +1055,8 @@ private final class HotKeyController {
     /// All checks and the final TIS selection run on the main queue without a second unchecked hop.
     private func scheduleReleaseSwitchCheck(releaseID: UUID, delay: TimeInterval, waitingForVoiceEnd: Bool) {
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pendingReleaseSwitchID == releaseID, self.enabled, !self.triggerPressed else { return }
+            guard let self, self.pendingReleaseSwitchID == releaseID, self.enabled,
+                  !self.systemSleeping, !self.triggerPressed else { return }
             guard InputSourceManager.shared.currentSourceID() == doubaoInputSourceID else {
                 self.cancelPendingReleaseSwitch(reason: "input-source-no-longer-doubao")
                 return
@@ -1366,6 +1624,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let initialStatus = started ? (UserDefaults.standard.bool(forKey: DefaultsKey.enabled) ? "运行中" : "已暂停") : "需要辅助功能权限"
         updateStatusMenu(listening: started, text: initialStatus)
         settingsWindow.show()
+    }
+
+    /// Releases notification registrations, timers, and the event tap during a normal application quit.
+    func applicationWillTerminate(_ notification: Notification) {
+        HotKeyController.shared.stop()
+        AppLog.shared.write("app terminating")
     }
 
     /// Shows settings when Finder opens the app while it is already running.
